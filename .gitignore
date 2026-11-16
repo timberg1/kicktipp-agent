@@ -1,0 +1,5 @@
+# Eigene, unbereinigte Exporte nie committen
+*.export.json
+export*.json
+.env
+.DS_Store

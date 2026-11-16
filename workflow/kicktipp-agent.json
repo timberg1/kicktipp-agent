@@ -1,0 +1,276 @@
+{
+  "name": "Kicktipp-Tipper",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "c0b5aba4-18f0-4370-821b-c6ac8cd9a94f",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "url": "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/odds",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "regions",
+              "value": "eu"
+            },
+            {
+              "name": "markets",
+              "value": "h2h"
+            },
+            {
+              "name": "oddsFormat",
+              "value": "decimal"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        224,
+        0
+      ],
+      "id": "91af700e-c05d-4092-a93a-69796e22a916",
+      "name": "Quoten abrufen",
+      "credentials": {
+        "httpQueryAuth": {
+          "name": "Query Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "c6b9add8-8ad7-408e-8444-7560ea8f4c3c",
+              "leftValue": "={{ $json.commence_time }}",
+              "rightValue": "={{ $now.plus({ days: 7}).toISO() }}",
+              "operator": {
+                "type": "dateTime",
+                "operation": "before"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.4,
+      "position": [
+        416,
+        0
+      ],
+      "id": "3b0146be-1883-4009-835a-6ddc26e6b0aa",
+      "name": "Nur dieser Spieltag"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== Kicktipp-Agent: Tipps berechnen (n8n Code-Node, \"Run Once for All Items\") =====\n// Eingabe: ein Item pro Spiel aus der Odds API (h2h + totals, Dezimalquoten).\n// Ausgabe: ein Item mit der fertigen Tippliste (\"nachricht\") und den Details (\"spiele\").\n// Modell: Poisson mit Dixon-Coles-Korrektur, an 1X2 (+ Über/Unter 2,5) kalibriert,\n// Tipp = höchster Erwartungswert unter dem Punkteschema der Runde.\n\nconst PUNKTE = { exakt: 4, diff: 3, tendenz: 2 }; // Punkteschema deiner Runde\nconst RHO_STANDARD = -0.11;\nconst MAXTORE = 9;\nconst MAX_TIPP = 6;\n\n// ---------- Modell ----------\nconst fak = [1];\nfor (let i = 1; i <= MAXTORE; i++) fak[i] = fak[i - 1] * i;\nconst poisson = (k, lam) => Math.exp(-lam) * Math.pow(lam, k) / fak[k];\n\nfunction tau(x, y, lh, la, rho) {\n  if (x === 0 && y === 0) return 1 - lh * la * rho;\n  if (x === 0 && y === 1) return 1 + lh * rho;\n  if (x === 1 && y === 0) return 1 + la * rho;\n  if (x === 1 && y === 1) return 1 - rho;\n  return 1;\n}\n\nfunction matrix(lh, la, rho) {\n  const m = [];\n  let s = 0;\n  for (let x = 0; x <= MAXTORE; x++) {\n    m.push([]);\n    for (let y = 0; y <= MAXTORE; y++) {\n      const w = poisson(x, lh) * poisson(y, la) * tau(x, y, lh, la, rho);\n      m[x].push(w);\n      s += w;\n    }\n  }\n  return m.map(z => z.map(w => w / s));\n}\n\nfunction kennzahlen(m) {\n  let h = 0, r = 0, a = 0, over = 0;\n  m.forEach((z, x) => z.forEach((w, y) => {\n    if (x > y) h += w; else if (x === y) r += w; else a += w;\n    if (x + y > 2.5) over += w;\n  }));\n  return { h, r, a, over };\n}\n\nfunction passeAn(p1, px, p2, pOver) {\n  const fehler = (lh, la, rho) => {\n    const k = kennzahlen(matrix(lh, la, rho));\n    let f = (k.h - p1) ** 2 + (k.r - px) ** 2 + (k.a - p2) ** 2;\n    if (pOver !== null) f += (k.over - pOver) ** 2;\n    return f;\n  };\n  const fitLambdas = rho => {\n    let best = [1.5, 1.2], bestF = Infinity;\n    let g = [0.15, 4.6, 0.10, 4.2], schritt = 0.10;\n    for (let stufe = 0; stufe < 3; stufe++) {\n      for (let lh = g[0]; lh <= g[1] + 1e-9; lh += schritt) {\n        for (let la = g[2]; la <= g[3] + 1e-9; la += schritt) {\n          const f = fehler(lh, la, rho);\n          if (f < bestF) { bestF = f; best = [lh, la]; }\n        }\n      }\n      g = [Math.max(0.05, best[0] - schritt), best[0] + schritt,\n           Math.max(0.05, best[1] - schritt), best[1] + schritt];\n      schritt /= 10;\n    }\n    return { best, bestF };\n  };\n  if (pOver === null) {\n    const { best } = fitLambdas(RHO_STANDARD);\n    return [best[0], best[1], RHO_STANDARD];\n  }\n  let erg = null, ergF = Infinity;\n  for (let i = 0; i < 15; i++) {\n    const rho = -0.26 + 0.02 * i;\n    const { best, bestF } = fitLambdas(rho);\n    if (bestF < ergF) { ergF = bestF; erg = [best[0], best[1], rho]; }\n  }\n  return erg;\n}\n\nfunction rangliste(m) {\n  const sgn = v => (v > 0) - (v < 0);\n  const liste = [];\n  for (let tx = 0; tx <= MAX_TIPP; tx++) {\n    for (let ty = 0; ty <= MAX_TIPP; ty++) {\n      let ev = 0, pExakt = 0;\n      m.forEach((z, x) => z.forEach((w, y) => {\n        if (x === tx && y === ty) { ev += PUNKTE.exakt * w; pExakt = w; }\n        else if (x - y === tx - ty) ev += PUNKTE.diff * w;\n        else if (sgn(x - y) === sgn(tx - ty)) ev += PUNKTE.tendenz * w;\n      }));\n      liste.push({ tipp: `${tx}:${ty}`, ev, pExakt });\n    }\n  }\n  return liste.sort((a, b) => b.ev - a.ev);\n}\n\n// ---------- Quoten aus der Odds API mitteln ----------\nconst mittel = arr => arr.reduce((s, v) => s + v, 0) / arr.length;\n\nfunction marktWahrscheinlichkeiten(spiel) {\n  const p1 = [], px = [], p2 = [], pOver = [], margen = [];\n  for (const buch of spiel.bookmakers || []) {\n    for (const markt of buch.markets || []) {\n      if (markt.key === 'h2h') {\n        const q = n => markt.outcomes.find(o => o.name === n)?.price;\n        const qh = q(spiel.home_team), qa = q(spiel.away_team), qd = q('Draw');\n        if (!qh || !qa || !qd) continue;\n        const s = 1 / qh + 1 / qd + 1 / qa;\n        p1.push(1 / qh / s); px.push(1 / qd / s); p2.push(1 / qa / s); margen.push(s - 1);\n      }\n      if (markt.key === 'totals') {\n        const o = markt.outcomes.find(x => x.name === 'Over' && x.point === 2.5);\n        const u = markt.outcomes.find(x => x.name === 'Under' && x.point === 2.5);\n        if (o && u) pOver.push((1 / o.price) / (1 / o.price + 1 / u.price));\n      }\n    }\n  }\n  if (!p1.length) return null;\n  const n = mittel(p1) + mittel(px) + mittel(p2);\n  return {\n    p1: mittel(p1) / n, px: mittel(px) / n, p2: mittel(p2) / n,\n    pOver: pOver.length ? mittel(pOver) : null,\n    marge: mittel(margen), buchmacher: p1.length,\n  };\n}\n\n// ---------- Hauptteil ----------\nconst fmt = (v, d = 2) => v.toFixed(d).replace('.', ',');\nconst anstoss = iso => new Date(iso).toLocaleString('de-DE', {\n  timeZone: 'Europe/Berlin', weekday: 'short', hour: '2-digit', minute: '2-digit',\n});\n\nconst spiele = [];\nfor (const item of $input.all()) {\n  const s = item.json;\n  const markt = marktWahrscheinlichkeiten(s);\n  if (!markt) continue;\n  const [lh, la, rho] = passeAn(markt.p1, markt.px, markt.p2, markt.pOver);\n  const rang = rangliste(matrix(lh, la, rho));\n  spiele.push({\n    heim: s.home_team,\n    gast: s.away_team,\n    anstoss: s.commence_time,\n    tipp: rang[0].tipp,\n    ev: Number(rang[0].ev.toFixed(3)),\n    pExakt: Number(rang[0].pExakt.toFixed(3)),\n    alternative: rang[1].tipp,\n    abstandZurAlternative: Number((rang[0].ev - rang[1].ev).toFixed(3)),\n    knapp: rang[0].ev - rang[1].ev < 0.05,\n    markt: {\n      heimsieg: Number(markt.p1.toFixed(3)),\n      remis: Number(markt.px.toFixed(3)),\n      auswaertssieg: Number(markt.p2.toFixed(3)),\n      ueber25: markt.pOver === null ? null : Number(markt.pOver.toFixed(3)),\n      buchmacher: markt.buchmacher,\n    },\n    erwarteteTore: `${fmt(lh)}:${fmt(la)}`,\n  });\n}\nspiele.sort((a, b) => a.anstoss.localeCompare(b.anstoss));\n\nconst gesamt = spiele.reduce((s, x) => s + x.ev, 0);\nconst zeilen = spiele.map(x => `${x.tipp}  ${x.heim} – ${x.gast} (${anstoss(x.anstoss)})${x.knapp ? ' *' : ''}`);\nconst nachricht = spiele.length\n  ? `Kicktipp – deine Tipps\\n\\n${zeilen.join('\\n')}\\n\\nErwartete Punkte: ${fmt(gesamt, 1)} (${fmt(gesamt / spiele.length)} pro Spiel)` +\n    (spiele.some(x => x.knapp) ? '\\n* knapp: Alternative fast gleich gut' : '')\n  : 'Kicktipp: Für die nächsten Tage wurden keine Bundesliga-Quoten gefunden.';\n\nreturn [{ json: { nachricht, gesamtEV: Number(gesamt.toFixed(2)), anzahl: spiele.length, spiele } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        0
+      ],
+      "id": "112b489e-589d-4f53-b2b8-a5c74868226e",
+      "name": "Tipps berechnen"
+    },
+    {
+      "parameters": {
+        "chatId": "DEINE_CHAT_ID",
+        "text": "={{ $('Tipps berechnen').item.json.nachricht }}  {{ $json.text }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1088,
+        -32
+      ],
+      "id": "5356088e-d5d2-45f5-bb05-43b98ffca50e",
+      "name": "Send a text message",
+      "retryOnFail": true,
+      "credentials": {
+        "telegramApi": {
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Du bist Co-Trainer meiner Kicktipp-Runde (Punkte: 4 exakt, 3 Tordifferenz, 2 Tendenz). Die Tipps unten hat ein mathematisches Modell aus Wettquoten berechnet.\n\nRegeln:\n- Ändere keinen Tipp.\n- Erfinde keine Fakten (keine Verletzungen, Formkurven, Aufstellungen).\n- Höchstens 3 kurze Sätze auf Deutsch, keine Einleitung, keine Emojis.\n\nInhalt:\n1. Nenne die knappen Spiele (knapp = true) mit ihrer Alternative.\n2. Nenne das laut Markt offenste Spiel (Heimsieg-, Remis- und Auswärtswahrscheinlichkeit am ähnlichsten).\n\nDaten:\n{{ JSON.stringify($json.spiele) }}",
+        "messages": {
+          "messageValues": []
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        736,
+        -112
+      ],
+      "id": "4725805d-9eed-43d9-803a-7fad2610825d",
+      "name": "Basic LLM Chain (KI-Kommentar)"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-haiku-5-5",
+          "mode": "list",
+          "cachedResultName": "Claude Haiku 5.5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        784,
+        224
+      ],
+      "id": "b62d2155-38ee-40bd-89cc-17ddfe111a58",
+      "name": "Anthropic Chat Model",
+      "credentials": {
+        "anthropicApi": {
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                5
+              ],
+              "triggerAtHour": 12
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        -144
+      ],
+      "id": "dd60c818-9ddd-407b-954b-5f37f24bfa61",
+      "name": "Schedule Trigger"
+    }
+  ],
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Quoten abrufen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Quoten abrufen": {
+      "main": [
+        [
+          {
+            "node": "Nur dieser Spieltag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nur dieser Spieltag": {
+      "main": [
+        [
+          {
+            "node": "Tipps berechnen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tipps berechnen": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain (KI-Kommentar)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain (KI-Kommentar)": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain (KI-Kommentar)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Quoten abrufen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "tags": [],
+  "pinData": {}
+}
